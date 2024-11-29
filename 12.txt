@@ -1,0 +1,3 @@
+Process ID: 12
+Process Name: process12
+Command Counter: 0

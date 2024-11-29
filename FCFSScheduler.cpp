@@ -35,7 +35,22 @@ void FCFS_Scheduler::print_CPU_UTIL() {
     std::cout << "Cores Available: " << num_cores - numOfRunningProcess << "\n";
     std::cout << "----------------\n";
 }
+int FCFS_Scheduler::GetCpuUtilizations()
+{
+    std::vector<int> active_cores;
 
+    for (auto& process : this->running_processes) {
+        //std::cout << "Core " << process->core_id << std::endl;
+
+        if (!(std::count(active_cores.begin(), active_cores.end(), process->core_id))) {
+            active_cores.push_back(process->core_id);
+        }
+    }
+
+    //std::cout << "Active Cores " << active_cores.size() << " / Number of Cores " << this->num_cores << std::endl;
+
+    return (active_cores.size() / static_cast<float>(this->num_cores)) * 100;
+}
 
 void FCFS_Scheduler::stop() {
     running = false;

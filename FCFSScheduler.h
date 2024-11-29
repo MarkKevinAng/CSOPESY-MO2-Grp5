@@ -18,8 +18,8 @@ private:
     std::mutex mtx;
     std::condition_variable cv;
     int num_cores;
-    std::list<Process*> running_processes;
-    std::list<Process*> finished_processes;
+ /*   std::list<Process*> running_processes;
+    std::list<Process*> finished_processes;*/
 
     void cpu_worker(int core_id);
 
@@ -27,6 +27,8 @@ public:
 
     FCFS_Scheduler(int cores);
     ~FCFS_Scheduler();
+    std::list<Process*> running_processes;
+    std::list<Process*> finished_processes;
 
     void add_process(Process* proc);
     void start();
@@ -41,4 +43,5 @@ public:
 
     bool isValidProcessName(const std::string& process_name);
     void print_CPU_UTIL();
+    int GetCpuUtilizations();
 };

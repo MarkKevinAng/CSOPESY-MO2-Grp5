@@ -11,6 +11,8 @@ private:
     static int next_process_id;
 
 public:
+    int frames_to_allocate;
+    bool isBackingStored;
 
     std::string name;
     int total_commands;
@@ -19,6 +21,9 @@ public:
     std::chrono::time_point<std::chrono::system_clock> start_time; 
     int core_id; 
     int process_id; 
+
+    int startAddress = -1; // memory start address
+    int endAddress = -1; // memory end address
 
     Process(const std::string& pname, int commands);
     ~Process();

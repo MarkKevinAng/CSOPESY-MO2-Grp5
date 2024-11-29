@@ -1,8 +1,14 @@
 #include "RRScheduler.h"
 #include <iostream>
 #include <chrono>
+#include "Process.h"
 #include "Config.h"
 #include <algorithm>
+#include <random>
+#include "MemoryManager.h"
+#include "PagingManager.h"
+#include "FirstFitManager.h"
+
 
 RR_Scheduler::RR_Scheduler(int cores, int quantum) : num_cores(cores), time_quantum(quantum), running(false) {}
 
@@ -12,14 +18,33 @@ RR_Scheduler::~RR_Scheduler() {
 
 void RR_Scheduler::add_process(Process* proc) {
     std::lock_guard<std::mutex> lock(mtx);
+
+    if (Config::GetConfigParameters().max_mem_per_proc == 1 && Config::GetConfigParameters().min_page_per_proc == 1) {
+
+    }
+    else {
+        PagingManager* paging = dynamic_cast<PagingManager*>(memoryManager);
+        proc->frames_to_allocate = paging->memProc / paging->pageSize;
+    }
     process_queue.push(proc);
     cv.notify_one();
 }
 
 void RR_Scheduler::start() {
+
+    if (!memoryManager) {
+        if (Config::GetConfigParameters().min_page_per_proc == 1 && Config::GetConfigParameters().max_page_per_proc == 1) {
+            memoryManager = new FirstFitManager(Config::GetConfigParameters().max_overall_mem);
+        }
+        else {
+            memoryManager = new PagingManager(Config::GetConfigParameters().max_overall_mem);
+        }
+    }
+
     running = true;
     start_time = std::chrono::steady_clock::now(); // Record the start time
     for (int i = 0; i < num_cores; ++i) {
+        isStealing = false;
         cpu_threads.emplace_back(&RR_Scheduler::cpu_worker, this, i);
     }
     //std::cout << "Scheduler started with " << num_cores << " cores.\n";
@@ -33,21 +58,85 @@ void RR_Scheduler::stop() {
             t.join();
         }
     }
+
     //std::cout << "Scheduler stopped.\n";
 }
 
 void RR_Scheduler::cpu_worker(int core_id) {
+    int quantumCycle = 0;
+    int idle_ticks = 0;  // Number of idle ticks
+    int active_ticks = 0;  // Number of active ticks
+    int total_ticks = 0;  // Total ticks across all cores
+
     while (running) {
         Process* proc = nullptr;
 
         {
-            std::unique_lock<std::mutex> lock(mtx);
+            std::unique_lock<std::mutex> lock(this->mtx);
+
             cv.wait(lock, [&] { return !process_queue.empty() || !running; });
 
             if (!running && process_queue.empty()) break;
 
             proc = process_queue.front();
             process_queue.pop();
+
+            if (proc->isBackingStored) {
+                memoryManager->load_process(proc);
+            }
+
+            if (!memoryManager->isAllocated(memoryManager->allocateMemory(proc))) {
+                // Handle the allocation attempts (backing store or stealing process)
+                bool isSecondTrySuccess = false;
+                std::queue<Process*> copy = process_queue;
+                std::vector<Process*> converted;
+
+                while (!copy.empty()) {
+                    Process* p = copy.front();
+                    copy.pop();
+                    // Conversion logic for the processes based on allocation type
+                    if (dynamic_cast<FirstFitManager*>(memoryManager) != nullptr) {
+                        if (p->startAddress != -1)
+                            converted.push_back(p);
+                    }
+                    else {
+                        PagingManager* pagingManager = dynamic_cast<PagingManager*>(memoryManager);
+                        if (pagingManager->expectedFramesPerProcess > p->frames_to_allocate) {
+                            converted.push_back(p);
+                        }
+                    }
+                }
+
+                if (converted.size() > 0) {
+                    std::random_device rd;
+                    std::mt19937 gen(rd());
+                    std::uniform_int_distribution<> dist(0, converted.size() - 1);
+                    shuffle(converted.begin(), converted.end(), rd);
+
+                    for (Process* shuffled : converted) {
+                        memoryManager->deallocateMemory(shuffled);
+                        memoryManager->store_process(shuffled);
+                        isSecondTrySuccess = memoryManager->isAllocated(memoryManager->allocateMemory(proc));
+                        if (isSecondTrySuccess) {
+                            break;
+                        }
+                    }
+                }
+
+                if (!isSecondTrySuccess) {
+                    // Handle stealing and allocation failure logic here
+                    std::unique_lock<std::mutex> stealLock(this->stealMtx);
+                    isStealing = true;
+                    stealCv.wait_for(stealLock, std::chrono::seconds(3), [&] { return !isStealing; });
+                    bool isThirdTrySuccess = memoryManager->isAllocated(memoryManager->allocateMemory(proc));
+
+                    if (!isThirdTrySuccess) {
+                        process_queue.push(proc);
+                        continue;
+                    }
+                }
+            }
+
             proc->core_id = core_id;
             proc->start_time = std::chrono::system_clock::now();
             running_processes.push_back(proc);
@@ -56,45 +145,65 @@ void RR_Scheduler::cpu_worker(int core_id) {
         int remaining_commands = proc->total_commands - proc->executed_commands;
         int commands_to_execute = std::min(time_quantum, remaining_commands);
         int executed_in_quantum = 0;
-        while (commands_to_execute > 0 && proc->executed_commands < proc->total_commands) {
-            {
-                std::lock_guard<std::mutex> lock(mtx);
 
-                proc->executed_commands += Config::GetConfigParameters().quantum_cycles; // time quantum
-                executed_in_quantum += Config::GetConfigParameters().quantum_cycles; // time quantum
+        while (commands_to_execute > 0 && proc->executed_commands < proc->total_commands) {
+            // If no process is running (idle tick)
+            if (proc == nullptr) {
+                idle_ticks++;
+            }
+            else {
+                active_ticks++;
+            }
+
+            {
+                proc->executed_commands += Config::GetConfigParameters().quantum_cycles;
+                executed_in_quantum += Config::GetConfigParameters().quantum_cycles;
                 if (proc->executed_commands >= proc->total_commands) {
                     proc->executed_commands = proc->total_commands;
                 }
-                //  proc->displayProcessInfo();
-
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
 
-            std::this_thread::sleep_for(std::chrono::milliseconds((int)(Config::GetConfigParameters().delay_per_exec * 1000))); // Simulated command execution time change this to delays per exec
+            std::this_thread::sleep_for(std::chrono::milliseconds((int)(Config::GetConfigParameters().delay_per_exec * 1000)));
 
             if (executed_in_quantum >= time_quantum) {
-                break; // Exit the loop to re-add the process to the queue
+                break;
             }
         }
 
-        if (proc->executed_commands < proc->total_commands) {
+        total_ticks++;  // Count the total tick (both active and idle)
 
-            add_process(proc); // Re-add process if it's not completed
+        // After finishing the execution or failing the allocation, move the process back to the queue or finish it
+        if (proc) {
             std::lock_guard<std::mutex> lock(mtx);
-            running_processes.remove(proc);
-
-        }
-        else {
-            //std::cout << "Process " << proc->name << " completed.\n";
-            std::lock_guard<std::mutex> lock(mtx);
-            running_processes.remove(proc);
-            finished_processes.push_back(proc);
-
+            if (proc->executed_commands < proc->total_commands) {
+                process_queue.push(proc);
+                running_processes.remove(proc);
+            }
+            else {
+                running_processes.remove(proc);
+                memoryManager->deallocateMemory(proc);
+                finished_processes.push_back(proc);
+            }
         }
     }
+    this->idleT = idle_ticks;
+	this->activeT = active_ticks;
+	this->totalT = total_ticks;
+    // After finishing processing on this core, call a function to display stats
+   
 }
+
+// Function to display the CPU stats
+void RR_Scheduler::display_cpu_stats() {
+    std::cout << "CPU Stats for Core:\n";
+    std::cout << "Idle CPU Ticks: " << this->idleT << "\n";
+    std::cout << "Active CPU Ticks: " << this->activeT << "\n";
+    std::cout << "Total CPU Ticks: " << this->totalT << "\n";
+    std::cout << "---------------------------------\n";
+}
+
 void RR_Scheduler::screen_ls() {
-    std::lock_guard<std::mutex> lock(mtx);
+    //std::lock_guard<std::mutex> lock(mtx);
     print_CPU_UTIL();
     print_running_processes();
     print_finished_processes();
@@ -141,12 +250,22 @@ bool RR_Scheduler::isValidProcessName(const std::string& process_name)
 }
 
 void RR_Scheduler::ReportUtil() {
-    int numOfRunningProcess = running_processes.size();
-    int numOfFinishedProcess = finished_processes.size();
+    int numOfRunningProcess = 0;
+    int numOfFinishedProcess = 0;
+    int cpuUtilization = 0;
+    for (auto& proc : running_processes) {
+        numOfRunningProcess++;
+    }
+    for (auto& proc : finished_processes) {
+        numOfFinishedProcess++;
+    }
+    if (numOfRunningProcess == num_cores) {
+        cpuUtilization = 100;
 
-    // Calculate CPU utilization as a percentage of used cores
-    int cpuUtilization = static_cast<int>((static_cast<double>(numOfRunningProcess) / num_cores) * 100);
-
+    }
+    else if (numOfRunningProcess == 0) {
+        cpuUtilization = 0;
+    }
     std::vector<int> cores_used;
     int total_executed_commands = 0;
     int total_commands = 0;
@@ -199,33 +318,47 @@ void RR_Scheduler::ReportUtil() {
 
 
 void RR_Scheduler::print_running_processes() {
-
     std::cout << "Running processes:\n";
     for (auto& proc : running_processes) {
-        std::cout << proc->name << " (" << proc->get_start_time() << ") Core: "
+        std::cout << proc->name << "\t(" << proc->get_start_time() << ")\t\tCore: "
             << (proc->core_id == -1 ? "N/A" : std::to_string(proc->core_id))
-            << " " << proc->executed_commands << " / " << proc->total_commands << "\n";
+            << "\t\t" << proc->executed_commands << " / " << proc->total_commands << "\n";
 
     }
-    std::cout << "----------------\n";
+    std::cout << std::endl;
 }
 void RR_Scheduler::print_finished_processes() {
 
     std::cout << "Finished processes:\n";
     for (auto& proc : finished_processes) {
-        std::cout << proc->name << " (" << proc->get_start_time() << ") Finished "
+        std::cout << proc->name << "\t(" << proc->get_start_time() << ")" << "\t\tFinished\t"
             << proc->executed_commands << " / " << proc->total_commands << "\n";
     }
-    std::cout << "----------------\n";
+    std::cout << "--------------------------------------------------\n";
+    std::cout << std::endl;
 }
 void RR_Scheduler::print_CPU_UTIL() {
-    int numOfRunningProcess = running_processes.size();
-    int cpuUtilization = static_cast<int>((static_cast<double>(numOfRunningProcess) / num_cores) * 100);
+    int numOfRunningProcess = 0;
+    int numOfFinishedProcess = 0;
+    int cpuUtilization = 0;
+    for (auto& proc : running_processes) {
+        numOfRunningProcess++;
+    }
+    for (auto& proc : finished_processes) {
+        numOfFinishedProcess++;
+    }
+    if (numOfRunningProcess == num_cores) {
+        cpuUtilization = 100;
 
-    std::cout << "CPU Utilization: " << cpuUtilization << "%\n";
+    }
+    else if (numOfRunningProcess == 0) {
+        cpuUtilization = 0;
+    }
+    std::cout << "Cpu Utilization: " << cpuUtilization << "%\n";
     std::cout << "Cores Used: " << numOfRunningProcess << "\n";
     std::cout << "Cores Available: " << num_cores - numOfRunningProcess << "\n";
-    std::cout << "----------------\n";
+    std::cout << std::endl;
+    std::cout << "--------------------------------------------------\n";
 }
 
 
@@ -278,3 +411,14 @@ void RR_Scheduler::print_process_details(const std::string& process_name, int sc
     std::cout << "Process " << process_name << " not found.\n";
 }
 
+int RR_Scheduler::GetCpuUtilization() {
+    std::vector<int> active_cores;
+
+    for (auto& process : this->running_processes) {
+        if (!(std::count(active_cores.begin(), active_cores.end(), process->core_id))) {
+            active_cores.push_back(process->core_id);
+        }
+    }
+
+    return (active_cores.size() / static_cast<float>(this->num_cores)) * 100;
+}

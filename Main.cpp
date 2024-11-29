@@ -7,12 +7,16 @@
 #include "Config.h"
 #include "RRScheduler.h"
 #include <random>
-
+#include "PagingManager.h"
+#include "FirstFitManager.h"
+#include "MemoryManager.h"
 
 int main() {
     displayHeader();
     std::string command;
-
+    int totalM = 0;
+    int usedM = 0;
+    int freeM = 0;
     ConsoleManager console_manager;
     bool running = true;
 
@@ -48,7 +52,12 @@ int main() {
                 Config::GetConfigParameters().batch_process_freq == NULL ||
                 Config::GetConfigParameters().min_ins == NULL ||
                 Config::GetConfigParameters().max_ins == NULL ||
-                Config::GetConfigParameters().delay_per_exec == NULL) {
+                Config::GetConfigParameters().delay_per_exec == NULL ||
+                Config::GetConfigParameters().max_overall_mem == NULL ||
+                Config::GetConfigParameters().min_mem_per_proc == NULL ||
+                Config::GetConfigParameters().max_mem_per_proc == NULL ||
+                Config::GetConfigParameters().min_page_per_proc == NULL ||
+                Config::GetConfigParameters().max_page_per_proc == NULL) {
                 std::cout << "Initialize the program with command \"initialize\"" << std::endl;
             }
         }
@@ -74,6 +83,127 @@ int main() {
         // Current console is the main menu and the exit command is entered.
         else if (command == "exit" && console_manager.getCurrentConsoleName() == "MAIN_MENU") {
             return false;
+        }
+        else if (command == "vmstat") {
+            if (Config::GetConfigParameters().scheduler == "fcfs") {
+            }
+            if (Config::GetConfigParameters().scheduler == "rr") {
+                float freeMem = 0, usedMemory = 0;
+                float totalMem;
+                int memUtil;
+
+                // Checks if memory allocator is first-fit
+                if (dynamic_cast<PagingManager*>(rr_scheduler.memoryManager) == nullptr) {
+                    FirstFitManager* ffm = dynamic_cast<FirstFitManager*>(rr_scheduler.memoryManager);
+
+                    for (int i = 0; i < ffm->getMemoryBlockList().size(); i++) {
+                        if (ffm->getMemoryBlockList()[i] == -1) {
+                            freeMem++;
+                        }
+                        else {
+                            usedMemory++;
+                        }
+                    }
+
+                    totalMem = Config::GetConfigParameters().max_overall_mem;
+                }
+                else {
+                    PagingManager* pm = dynamic_cast<PagingManager*>(rr_scheduler.memoryManager);
+                    freeMem = pm->currentFrames * pm->pageSize;
+                    totalMem = pm->maxFrames * pm->pageSize;
+                    usedMemory = totalMem - freeMem;
+                }
+
+                memUtil = (usedMemory / totalMem) * 100;
+              
+
+                std::cout << "Total Memory: " << totalMem << "\n";
+                std::cout << "Used Memory: " << usedMemory << "\n";
+                std::cout << "Free Memory: " << totalMem - usedMemory << "\n";
+
+
+
+            }
+
+        }
+        else if (command == "process-smi") {
+            float cpuUtilization = 0.0f;
+
+            if (Config::GetConfigParameters().scheduler == "fcfs") {
+                cpuUtilization = fcfs_scheduler.GetCpuUtilizations();
+            }
+
+            if (Config::GetConfigParameters().scheduler == "rr") {
+                cpuUtilization = rr_scheduler.GetCpuUtilization();
+            }
+            float freeMem = 0, usedMemory = 0;
+            float totalMem;
+            int memUtil;
+
+            // Checks if memory allocator is first-fit
+            if (dynamic_cast<PagingManager*>(rr_scheduler.memoryManager) == nullptr) {
+                FirstFitManager* ffm = dynamic_cast<FirstFitManager*>(rr_scheduler.memoryManager);
+
+                for (int i = 0; i < ffm->getMemoryBlockList().size(); i++) {
+                    if (ffm->getMemoryBlockList()[i] == -1) {
+                        freeMem++;
+                    }
+                    else {
+                        usedMemory++;
+                    }
+                }
+
+                totalMem = Config::GetConfigParameters().max_overall_mem;
+            }
+            else {
+                PagingManager* pm = dynamic_cast<PagingManager*>(rr_scheduler.memoryManager);
+                freeMem = pm->currentFrames * pm->pageSize;
+                totalMem = pm->maxFrames * pm->pageSize;
+                usedMemory = totalMem - freeMem;
+            }
+
+            memUtil = (usedMemory / totalMem) * 100;
+
+            std::cout << std::endl;
+            std::cout << "-------------------------------------------" << std::endl;
+            std::cout << "| PROCESS-SMI V01.00 Driver Version 01.00 |" << std::endl;
+            std::cout << "-------------------------------------------" << std::endl;
+            std::cout << "CPU-Util: " << cpuUtilization << "%" << std::endl;
+            std::cout << "Memory Usage: " << usedMemory << "KB / " << Config::GetConfigParameters().max_overall_mem << "KB" << std::endl;
+            std::cout << "Memory Util: " << memUtil << "%" << std::endl;
+            std::cout << std::endl;
+            std::cout << "===================================" << std::endl;
+            std::cout << "Running processes and memory usage:" << std::endl;
+
+            if (Config::GetConfigParameters().scheduler == "fcfs") {
+                for (const auto& process : fcfs_scheduler.running_processes) {
+                    int proc_mem = 0;
+                    if (dynamic_cast<PagingManager*>(rr_scheduler.memoryManager) == nullptr) {
+                        proc_mem = process->endAddress - process->startAddress;
+                    }
+                    else {
+                        PagingManager* pm = dynamic_cast<PagingManager*>(rr_scheduler.memoryManager);
+                        proc_mem = pm->pageSize * pm->expectedFramesPerProcess;
+                    }
+
+                    std::cout << process->name << " " << proc_mem << "KB" << std::endl;
+                }
+            }
+
+            if (Config::GetConfigParameters().scheduler == "rr") {
+                for (const auto& process : rr_scheduler.running_processes) {
+                    int proc_mem = 0;
+                    if (dynamic_cast<PagingManager*>(rr_scheduler.memoryManager) == nullptr) {
+                        proc_mem = process->endAddress - process->startAddress;
+                    }
+                    else {
+                        PagingManager* pm = dynamic_cast<PagingManager*>(rr_scheduler.memoryManager);
+                        proc_mem = pm->pageSize * pm->expectedFramesPerProcess;
+                    }
+
+                    std::cout << process->name << " " << proc_mem << "KB" << std::endl;
+                }
+            }
         }
 
         // Current console is the main menu and the screen -s (create process) is entered.

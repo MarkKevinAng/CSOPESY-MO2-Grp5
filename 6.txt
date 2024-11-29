@@ -1,0 +1,3 @@
+Process ID: 6
+Process Name: process6
+Command Counter: 0
